@@ -7,16 +7,24 @@ import type {
 	INodeTypeDescription,
 } from 'n8n-workflow';
 
-import { BINARY_ENCODING } from 'n8n-workflow';
+import { BINARY_ENCODING, NodeOperationError } from 'n8n-workflow';
 
-import type { Readable } from 'stream';
+import { Readable } from 'stream';
 
-import * as openpgp from 'openpgp';
+import {
+	createMessage,
+	decrypt,
+	decryptKey,
+	encrypt,
+	readKey,
+	readMessage,
+	readPrivateKey,
+} from 'openpgp';
 
 export class Pgp implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'PGP',
-		// eslint-disable-next-line
+		// eslint-disable-next-line n8n-nodes-base/node-class-description-name-miscased
 		name: 'PGP',
 		icon: 'file:pgplogo.svg',
 		group: ['input'],
@@ -136,18 +144,36 @@ export class Pgp implements INodeType {
 		const returnData: INodeExecutionData[] = [];
 		const operation = this.getNodeParameter('operation', 0);
 		const credentials = await this.getCredentials('pgpKey');
+
+		const privateKey = credentials.privateKey
+			? await decryptKey({
+					privateKey: await readPrivateKey({
+						armoredKey: (credentials.privateKey as string).replace(/\\n/g, '\n'),
+					}),
+					passphrase: credentials.passphrase as string,
+			  })
+			: undefined;
+		const publicKey = credentials.publicKey
+			? await readKey({ armoredKey: (credentials.publicKey as string).replace(/\\n/g, '\n') })
+			: undefined;
+
+		if (operation === 'encrypt' && !publicKey)
+			throw new NodeOperationError(this.getNode(), 'Missing public key for encryption');
+		if (operation === 'decrypt' && !privateKey)
+			throw new NodeOperationError(this.getNode(), 'Missing private key for decryption');
+
 		let responseData;
 
 		for (let i = 0; i < items.length; i++) {
 			const dataType = this.getNodeParameter('type', i) as string;
 			try {
 				if (operation === 'encrypt') {
-					const publicKey = await openpgp.readKey({ armoredKey: credentials.key as string });
 					if (dataType === 'string') {
 						const data = this.getNodeParameter('text', i) as string;
-						const encrypted = await openpgp.encrypt({
-							message: await openpgp.createMessage({ text: data }),
+						const encrypted = await encrypt({
+							message: await createMessage({ text: data }),
 							encryptionKeys: publicKey,
+							signingKeys: privateKey,
 						});
 						responseData = [{ encrypted }];
 					}
@@ -163,18 +189,24 @@ export class Pgp implements INodeType {
 
 						let pgpData: Buffer | Readable;
 						if (binaryData.id) {
-							pgpData = this.helpers.getBinaryStream(binaryData.id);
+							pgpData = await this.helpers.getBinaryStream(binaryData.id);
 						} else {
 							pgpData = Buffer.from(binaryData.data, BINARY_ENCODING);
 						}
 
-						const encrypted = await openpgp.encrypt({
-							message: await openpgp.createMessage({ binary: pgpData }),
+						const encrypted = await encrypt({
+							message: await createMessage({ binary: pgpData }),
 							encryptionKeys: publicKey,
+							signingKeys: privateKey,
 							format: 'binary',
 						});
 
-						const buffer = Buffer.from(encrypted as Uint8Array);
+						let buffer;
+						if (binaryData.id) {
+							buffer = await this.helpers.binaryToBuffer(encrypted as Readable);
+						} else {
+							buffer = Buffer.from(encrypted as Uint8Array);
+						}
 
 						items[i].binary![outputBinaryPropertyName] = await this.helpers.prepareBinaryData(
 							buffer,
@@ -190,20 +222,18 @@ export class Pgp implements INodeType {
 					}
 				}
 
+				// TODO Add support for verifying detached signature
 				if (operation === 'decrypt') {
-					const privateKey = await openpgp.decryptKey({
-						privateKey: await openpgp.readPrivateKey({ armoredKey: credentials.key as string }),
-						passphrase: credentials.passphrase as string,
-					});
-
 					if (dataType === 'string') {
-						const message = await openpgp.readMessage({
+						const message = await readMessage({
 							armoredMessage: this.getNodeParameter('text', i) as string,
 						});
 
-						const { data: decrypted } = await openpgp.decrypt({
+						const { data: decrypted } = await decrypt({
 							message,
 							decryptionKeys: privateKey,
+							verificationKeys: publicKey,
+							expectSigned: !!publicKey,
 						});
 						responseData = [{ decrypted }];
 					}
@@ -218,28 +248,35 @@ export class Pgp implements INodeType {
 
 						let pgpData: Buffer | Readable;
 						if (binaryData.id) {
-							pgpData = this.helpers.getBinaryStream(binaryData.id);
+							pgpData = await this.helpers.getBinaryStream(binaryData.id);
 						} else {
 							pgpData = Buffer.from(binaryData.data, BINARY_ENCODING);
 						}
 
-						const encryptedMessage = await openpgp.readMessage({
+						const encryptedMessage = await readMessage({
 							binaryMessage: pgpData,
 						});
-						const { data: decrypted } = await openpgp.decrypt({
+						const { data: decrypted } = await decrypt({
 							message: encryptedMessage,
 							decryptionKeys: privateKey,
 							format: 'binary',
+							verificationKeys: publicKey,
+							expectSigned: !!publicKey,
 						});
 
-						const buffer = Buffer.from(decrypted as Uint8Array);
+						let buffer;
+						if (binaryData.id) {
+							buffer = await this.helpers.binaryToBuffer(decrypted as Readable);
+						} else {
+							buffer = Buffer.from(decrypted as Uint8Array);
+						}
 
 						items[i].binary![outputBinaryPropertyName] = await this.helpers.prepareBinaryData(
 							buffer,
 						);
-						let tempFileName = binaryData.fileName || "";
-						if(tempFileName.endsWith('.pgp')){
-							tempFileName = tempFileName?.slice(0,-4);
+						let tempFileName = binaryData.fileName || '';
+						if (tempFileName.endsWith('.pgp')) {
+							tempFileName = tempFileName?.slice(0, -4);
 						}
 						items[i].binary![outputBinaryPropertyName].fileName = `${tempFileName}`;
 

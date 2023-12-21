@@ -12,6 +12,7 @@ import { BINARY_ENCODING, NodeOperationError } from 'n8n-workflow';
 import { Readable } from 'stream';
 
 import {
+	VerificationResult,
 	createMessage,
 	decrypt,
 	decryptKey,
@@ -162,6 +163,19 @@ export class Pgp implements INodeType {
 		if (operation === 'decrypt' && !privateKey)
 			throw new NodeOperationError(this.getNode(), 'Missing private key for decryption');
 
+		const verifySignature = async (signatures: VerificationResult[]) => {
+			if (publicKey && signatures?.length > 0) {
+				try {
+					await signatures[0].verified;
+				} catch (error) {
+					throw new NodeOperationError(
+						this.getNode(),
+						`Could not verify signature: ${error.message}`,
+					);
+				}
+			}
+		};
+
 		let responseData;
 
 		for (let i = 0; i < items.length; i++) {
@@ -229,12 +243,12 @@ export class Pgp implements INodeType {
 							armoredMessage: this.getNodeParameter('text', i) as string,
 						});
 
-						const { data: decrypted } = await decrypt({
+						const { data: decrypted, signatures } = await decrypt({
 							message,
 							decryptionKeys: privateKey,
 							verificationKeys: publicKey,
-							expectSigned: !!publicKey,
 						});
+						verifySignature(signatures);
 						responseData = [{ decrypted }];
 					}
 					if (dataType === 'file') {
@@ -256,13 +270,13 @@ export class Pgp implements INodeType {
 						const encryptedMessage = await readMessage({
 							binaryMessage: pgpData,
 						});
-						const { data: decrypted } = await decrypt({
+						const { data: decrypted, signatures } = await decrypt({
 							message: encryptedMessage,
 							decryptionKeys: privateKey,
 							format: 'binary',
 							verificationKeys: publicKey,
-							expectSigned: !!publicKey,
 						});
+						verifySignature(signatures);
 
 						let buffer;
 						if (binaryData.id) {
